@@ -1,0 +1,9 @@
+Métrica,Valor
+Media original de los 10 valores,7.3
+Desv. estándar de la distribución de medias (bootstrap),0.8124507170387394
+Mínimo de las medias,3.5
+Máximo de las medias,9.0
+Constante de rechazo c,2.642
+Tasa de aceptación (AR),0.3786014462575247
+Propuestas totales (AR),26413.0
+Muestras aceptadas (AR),10000.0
