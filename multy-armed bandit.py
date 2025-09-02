@@ -1,125 +1,190 @@
+# -*- coding: utf-8 -*-
 # Python 3.9+
-# Bandits: 3 restaurantes (R1, R2, R3) con recompensas ~ Normal(mu, sigma)
-# Estrategia: ε-greedy (ε fijo o decreciente)
+# Multi-armed bandit con ε-greedy y exploración balanceada.
+# Incluye modo con CUOTA fija de exploración (como en la pizarra)
+# y cálculo de P teórico.
 
 from dataclasses import dataclass
+from typing import List, Dict, Literal
 import numpy as np
 import random
-from typing import List, Tuple
+
+Policy = Literal["eps_quota", "eps_prob"]
+ExploitRule = Literal["Q", "true_mu"]
 
 @dataclass
 class Restaurante:
     nombre: str
     mu: float
     sigma: float
-
     def sample(self) -> float:
-        # Muestra una recompensa (satisfacción) del restaurante
         return float(np.random.normal(self.mu, self.sigma, size=1)[0])
 
-def epsilon_schedule(t: int, eps0: float = 0.10, eps_min: float = 0.02, k: float = 50.0) -> float:
-    """
-    ε decreciente: eps(t) = max(eps_min, eps0 / (1 + t/k))
-    - eps0: ε inicial
-    - eps_min: piso de ε
-    - k: controla qué tan rápido cae
-    """
-    return max(eps_min, eps0 / (1.0 + t / k))
+# ---------- Métricas teóricas ----------
+def st_teorico(eps: float, M: int, mus: List[float]) -> float:
+    """ST esperado si exploras εM veces y luego explotas al mejor verdadero."""
+    mu_star = max(mus)
+    mu_prom = sum(mus) / len(mus)
+    E = eps * M
+    return E * mu_prom + (M - E) * mu_star
 
-def run_epsilon_greedy(
+def p_teorico(eps: float, M: int, mus: List[float]) -> float:
+    """P = SM - ST teórico."""
+    mu_star = max(mus)
+    SM = M * mu_star
+    ST = st_teorico(eps, M, mus)
+    return SM - ST
+
+# ---------- Simulación ----------
+def run_bandit(
     restaurantes: List[Restaurante],
     M: int = 300,
-    epsilon_fijo: float = None,   # si se da, usa ε fijo; si es None, usa schedule decreciente
-    seed: int = 42
-) -> dict:
-    random.seed(seed)
-    np.random.seed(seed)
-
+    epsilon: float = 0.07,                 # 7%
+    policy: Policy = "eps_quota",          # "eps_quota" (cuota fija) o "eps_prob" (probabilístico)
+    explore_strategy: str = "balanced",    # "balanced" reparte por igual
+    exploit_rule: ExploitRule = "true_mu", # "true_mu" reproduce la pizarra; "Q" usa estimados
+    seed: int = 123
+) -> Dict:
+    random.seed(seed); np.random.seed(seed)
     K = len(restaurantes)
-    # Estimaciones Q(a) y conteos N(a)
-    Q = [0.0] * K
-    N = [0] * K
 
+    Q = [0.0] * K           # medias estimadas
+    N = [0] * K             # conteos por brazo
     total_reward = 0.0
+
     elecciones = []
 
-    # Inicializa explorando una vez cada brazo (opcional pero recomendado)
-    for a in range(K):
-        r = restaurantes[a].sample()
-        Q[a] = r
-        N[a] = 1
-        total_reward += r
-        elecciones.append(a)
+    # --- Modo con CUOTA fija de exploración (primero explora, luego explota) ---
+    if policy == "eps_quota":
+        E = int(round(epsilon * M))        # pizarra: exploras exactamente εM días
+        # Objetivo por brazo (balanceado)
+        base = E // K
+        per_arm_targets = [base] * K
+        for i in range(E % K):             # reparte remanente si no es divisible
+            per_arm_targets[i] += 1
+        explored = [0] * K
 
-    # Rondas restantes
-    for t in range(K, M):
-        eps = epsilon_fijo if epsilon_fijo is not None else epsilon_schedule(t)
-        # Explora con prob ε; explota con 1-ε
-        if random.random() < eps:
-            a = random.randrange(K)
-        else:
-            # argmax con desempate aleatorio
-            maxQ = max(Q)
-            candidatos = [i for i, q in enumerate(Q) if q == maxQ]
-            a = random.choice(candidatos)
+        # Fase de EXPLORACIÓN balanceada (E pasos)
+        for t in range(E):
+            # elige el brazo con menor exploración respecto a su objetivo
+            candidatos = [i for i in range(K) if explored[i] < per_arm_targets[i]]
+            if not candidatos:
+                a = t % K
+            else:
+                a = min(candidatos, key=lambda i: (explored[i], i))
+            r = restaurantes[a].sample()
+            explored[a] += 1
+            N[a] += 1
+            Q[a] += (r - Q[a]) / N[a]
+            total_reward += r
+            elecciones.append(a)
 
-        r = restaurantes[a].sample()
-        elecciones.append(a)
-        total_reward += r
+        # Fase de EXPLOTACIÓN (M-E pasos)
+        for t in range(E, M):
+            if exploit_rule == "true_mu":
+                a = max(range(K), key=lambda i: restaurantes[i].mu)  # mejor verdadero
+            else:
+                maxQ = max(Q)
+                cand = [i for i, q in enumerate(Q) if q == maxQ]
+                a = random.choice(cand)
+            r = restaurantes[a].sample()
+            N[a] += 1
+            Q[a] += (r - Q[a]) / N[a]
+            total_reward += r
+            elecciones.append(a)
 
-        # Actualización incremental de Q(a)
-        N[a] += 1
-        Q[a] += (r - Q[a]) / N[a]
+    # --- Modo probabilístico clásico (ε por paso) ---
+    else:
+        def epsilon_schedule(_t: int) -> float:
+            return epsilon  # fijo
+        # (opcional) una pasada inicial para no arrancar en cero
+        for a in range(K):
+            r = restaurantes[a].sample()
+            N[a] = 1; Q[a] = r
+            total_reward += r
+            elecciones.append(a)
+
+        for t in range(K, M):
+            eps = epsilon_schedule(t)
+            if random.random() < eps:  # EXPLORAR
+                if explore_strategy == "balanced":
+                    a = min(range(K), key=lambda i: N[i])   # menos muestreado
+                else:
+                    a = random.randrange(K)
+            else:  # EXPLOTAR (por Q)
+                maxQ = max(Q)
+                cand = [i for i, q in enumerate(Q) if q == maxQ]
+                a = random.choice(cand)
+            r = restaurantes[a].sample()
+            N[a] += 1
+            Q[a] += (r - Q[a]) / N[a]
+            total_reward += r
+            elecciones.append(a)
 
     # Métricas
-    mu_opt = max(r.mu for r in restaurantes)
-    reward_opt_esperado = mu_opt * M
-    regret = reward_opt_esperado - total_reward
+    mus = [r.mu for r in restaurantes]
+    mu_star = max(mus)
+    SM = M * mu_star
+    ST = total_reward
+    P_sim = SM - ST
 
-    # Ranking estimado por Q
     ranking = sorted([(restaurantes[i].nombre, Q[i]) for i in range(K)],
                      key=lambda x: x[1], reverse=True)
-
-    # Resumen de elecciones
-    conteos = [elecciones.count(i) for i in range(K)]
-    porcentajes = [100.0 * c / M for c in conteos]
+    porcentajes = [100.0 * n / M for n in N]
 
     return {
-        "total_reward": total_reward,
-        "regret_vs_optimo": regret,
+        "total_reward_ST": ST,
+        "SM": SM,
+        "P_simulado": P_sim,
+        "P_teorico": p_teorico(epsilon, M, mus),
         "Q_estimados": {restaurantes[i].nombre: Q[i] for i in range(K)},
-        "conteos": {restaurantes[i].nombre: conteos[i] for i in range(K)},
+        "conteos": {restaurantes[i].nombre: N[i] for i in range(K)},
         "porcentajes": {restaurantes[i].nombre: porcentajes[i] for i in range(K)},
         "ranking_estimado": ranking,
-        "elecciones_indices": elecciones,
+        "policy": policy,
+        "epsilon": epsilon
     }
 
+# ---------- Demo ----------
 if __name__ == "__main__":
-    # Parámetros según tu pizarra (ajusta si es necesario)
-    mus =   [10.0, 8.0, 5.0]
-    sigmas = [5.0, 4.0, 2.5]
-    restaurantes = [
-        Restaurante("R1", mus[0], sigmas[0]),
-        Restaurante("R2", mus[1], sigmas[1]),
-        Restaurante("R3", mus[2], sigmas[2]),
-    ]
+    # Parámetros de la pizarra
+    R1 = Restaurante("R1", 10.0, 5.0)
+    R2 = Restaurante("R2", 8.0, 4.0)
+    R3 = Restaurante("R3", 5.0, 2.5)
+    restaurantes = [R1, R2, R3]
 
-    # --- Ejecución con ε decreciente ---
-    res_decay = run_epsilon_greedy(restaurantes, M=300, epsilon_fijo=None, seed=123)
-    print("=== ε-greedy con ε decreciente ===")
-    print("Satisfacción total:", round(res_decay["total_reward"], 2))
-    print("Regret vs óptimo (300*10):", round(res_decay["regret_vs_optimo"], 2))
-    print("Q estimados:", {k: round(v, 3) for k, v in res_decay["Q_estimados"].items()})
-    print("Conteos:", res_decay["conteos"])
-    print("Porcentajes (%):", {k: round(v, 1) for k, v in res_decay["porcentajes"].items()})
-    print("Ranking estimado:", res_decay["ranking_estimado"])
+    M = 300
+    EPS = 0.07  # <<< 7%
 
-    # --- Ejecución con ε fijo (por ejemplo 0.1) ---
-    res_fixed = run_epsilon_greedy(restaurantes, M=300, epsilon_fijo=0.10, seed=123)
-    print("\n=== ε-greedy con ε fijo=0.10 ===")
-    print("Satisfacción total:", round(res_fixed["total_reward"], 2))
-    print("Regret vs óptimo (300*10):", round(res_fixed["regret_vs_optimo"], 2))
-    print("Q estimados:", {k: round(v, 3) for k, v in res_fixed["Q_estimados"].items()})
-    print("Conteos:", res_fixed["conteos"])
-    print("Porcentajes (%):", {k: round(v, 1) for k, v in res_fixed["porcentajes"].items()})
-    print("Ranking estimado:", res_fixed["ranking_estimado"])
+    # Modo pizarra: explora εM balanceado y luego explota al mejor real
+    res_quota = run_bandit(
+        restaurantes, M=M, epsilon=EPS,
+        policy="eps_quota",
+        exploit_rule="true_mu",   # produce P_teórico=49 con estos datos
+        seed=123
+    )
+    print("=== ε-greedy (cuota fija, exploración balanceada, explotación por μ verdadero) ===")
+    print("ST (simulado):", round(res_quota["total_reward_ST"], 2))
+    print("SM:", res_quota["SM"])
+    print("P_simulado:", round(res_quota["P_simulado"], 2))
+    print("P_teorico:", res_quota["P_teorico"])
+    print("Conteos:", res_quota["conteos"])
+    print("Porcentajes (%):", {k: round(v, 1) for k, v in res_quota["porcentajes"].items()})
+    print("Ranking estimado (Q):", [(n, round(q, 3)) for n, q in res_quota["ranking_estimado"]])
+
+    # Modo ε probabilístico clásico (por si quieres comparar)
+    res_prob = run_bandit(
+        restaurantes, M=M, epsilon=EPS,
+        policy="eps_prob",
+        explore_strategy="balanced",
+        exploit_rule="Q",
+        seed=123
+    )
+    print("\n=== ε-greedy (probabilístico, exploración balanceada, explotación por Q) ===")
+    print("ST (simulado):", round(res_prob["total_reward_ST"], 2))
+    print("SM:", res_prob["SM"])
+    print("P_simulado:", round(res_prob["P_simulado"], 2))
+    print("P_teorico:", res_prob["P_teorico"])
+    print("Conteos:", res_prob["conteos"])
+    print("Porcentajes (%):", {k: round(v, 1) for k, v in res_prob["porcentajes"].items()})
+    print("Ranking estimado (Q):", [(n, round(q, 3)) for n, q in res_prob["ranking_estimado"]])
